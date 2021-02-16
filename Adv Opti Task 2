@@ -1,5 +1,5 @@
-# Specify term (5 or 7) and half (1 or 2) to solve for
-solve_term = 5
+# Specify term (5 or 7 or 0 for all) and half (1 or 2) to solve for
+solve_term = 0
 solve_half = 1
 
 T = 92 # the last time-index, corresponding to the Fri 1300-1330 timeslot
@@ -23,26 +23,34 @@ assert type(solve_term) == int and type(solve_half) == int
 with warnings.catch_warnings():
 	warnings.simplefilter("ignore")
 
-	ttdata_half = ttdata_full[ttdata_full["term_half"]==solve_half]
+	ttdata_half = ttdata_full[ttdata_full["term_half"]==solve_half].reset_index() # both terms
 	ttdata_T5 = ttdata_half[ttdata_half["term"]=="ESD T5"].reset_index() # T5 only
 	ttdata_T7 = ttdata_half[ttdata_half["term"]!="ESD T5"].reset_index() # T7 & TAE only
 
 	ttdata_other_half = ttdata_otherpillars[ttdata_otherpillars["term_half"]==solve_half]
 
-if solve_term == 5:
+if solve_term == 0:
+	df = ttdata_half
+elif solve_term == 5:
 	df = ttdata_T5
 else:
 	df = ttdata_T7
 
 # multidict for ESD subjects
-jobs, proc, instructor, venue, subject, prec, class_num = gp.multidict({
+jobs, proc, instructor, venue, subject, prec, class_num, ft_core, ft_av, ft_ba, ft_fn, ft_sc, ft_ui = gp.multidict({
 	df["job_ix"][i]: [
 		df["proc_time"][i],
 		df["instructor"][i],
 		df["venue_ix"][i],
 		df["subject_ix"][i],
 		df["precedence"][i],
-		df["class_num"][i]
+		df["class_num"][i],
+		df["track_core"][i],
+		df["track_avi"][i],
+		df["track_ba"][i],
+		df["track_fin"][i],
+		df["track_scl"][i],
+		df["track_uis"][i],
 	] for i in range(len(df))
 })
 
@@ -55,9 +63,9 @@ blocker, non_ESD_venue, block_start, block_end = gp.multidict({
 	] for i in range(len(ttdata_other_half))
 })
 
-print("\nRead data into multidict for Term %d" % solve_term)
+print("\nRead data into multidict")
 
-### Create Gurobi model and define variables ################################
+### Define variables & objective function ###################################
 completion_time = {(j,v,t): t + proc[j] for j in jobs for v in set(venue.values()) for t in range(1,T+1)}
 
 print("Problem space: %d ESD jobs x %d venues x %d time indices = %d\n"
@@ -71,36 +79,30 @@ X = m.addVars(completion_time.keys(), vtype=GRB.BINARY, name="X")
 EOD_splits = [(j,k,t) for j in jobs for k in jobs for t in range(4)]
 E = m.addVars(EOD_splits, vtype=GRB.BINARY, name="E")
 
-# Define objective function #################################################
-
-if solve_term == 5:
-	df_core = df[df["track_core"]==1].reset_index()
-	jobs_core = [df_core["job_ix"][i] for i in range(len(df_core))]
-	m.setObjective(gp.quicksum(X[j,v,t]*completion_time[j,v,t] for j in jobs_core for v in set(venue.values()) for t in range(1,T+1)), GRB.MINIMIZE)
+# Variables to prevent clashes between focus track subjects
+if solve_term  == 0:
+	ft_list = [ft_core, ft_av, ft_ba, ft_fn, ft_sc, ft_ui]
+elif solve_term == 5:
+	ft_list = [ft_core]
 else:
-	tracks = ["track_avi", "track_ba", "track_fin", "track_scl", "track_uis"]
-	all_tracks_sums = []
-	
-	for track in tracks:
-		df_track = df[df[track]==1].reset_index()
-		track_jobs = [df_track["job_ix"][i] for i in range(len(df_track))]
+	ft_list = [ft_av, ft_ba, ft_fn, ft_sc, ft_ui]
 
-		track_sum = gp.quicksum(X[j,v,t]*completion_time[j,v,t] for j in track_jobs for v in set(venue.values()) for t in range(1,T+1))
-		all_tracks_sums.append(track_sum)
-	
-	print("\n\n\nterm 7 obj func needs to change\n\n\n")
-	z_term7 = 0
-	m.addConstr((z_term7 == gp.max_(all_tracks_sums)), "obj func for Term 7")
-	m.setObjective(z_term7, GRB.MINIMIZE)
+# Variables to penalise the lack of breaks between classes of a focus track
+#     Let Br=1 if class is in progress, modified (30min after it ends, it is still "in progress")
+Br = {(j,t): X.sum(j,"*",s) for j in jobs for t in range(1,T+1) for s in range(max(0,t-proc[j]), t+1) }
+Z = m.addVars([(j,k,t) for j in jobs for k in jobs for t in range(1,T+1)], vtype=GRB.BINARY, name="Z")
+
+# Objective: minimise the lack of breaks
+m.setObjective(gp.quicksum(Z[j,k,t] for j in jobs for k in jobs for t in range(1,T+1)), GRB.MINIMIZE)
 
 print("\nObjective function defined")
 
 ### Define constraints ######################################################
 
-### All classes must be assigned
+### B1: All classes must be assigned
 m.addConstrs((X.sum(j,"*","*")==1 for j in jobs), "all jobs assigned")
 
-### At most 1 class at any venue at any time instant
+### B2: At most 1 class at any venue at any time instant
 for v in set(venue.values()):
 	for t in range(1,T+1):
 		jobs_in_venue = 0
@@ -109,7 +111,7 @@ for v in set(venue.values()):
 				jobs_in_venue += X[j,v,s]
 		m.addConstr(jobs_in_venue <= 1, "<=1 job per venue per time")
 
-### At most 1 class per instructor at any time instant
+### B3: At most 1 class per instructor at any time instant
 for instr in set(instructor.values()):
 	jobs_under_instructor = [j for j in jobs if instructor[j]==instr]
 	#print("%s %s" % (instr, jobs_under_instructor))
@@ -121,16 +123,16 @@ for instr in set(instructor.values()):
 				jobs_being_done += X.sum(j,"*",s)
 		m.addConstr(jobs_being_done <= 1, "<=1 job per prof per time")
 
-### Venues are blocked by other pillars/HASS
+### B5: Venues are blocked by other pillars/HASS
 for v in set(venue.values()):
 	for b in blocker:
 		if v == non_ESD_venue[b]:
 			m.addConstrs((X.sum("*",v,t)==0 for t in range(block_start[b], block_end[b]+1)), "venues blocked by other pillars")
 
-### Venues are blocked by EOD
+### B6: Venues are blocked by EOD
 m.addConstrs((X.sum("*","*",t)==0 for t in EOD_timings), "venues blocked by EOD")
 
-### Precedence constraints within the same subject & At most one session of each subject in a day
+### B4 & A2: Precedence constraints within the same subject & At most one session of each subject in a day
 lecture_str = re.compile("L")
 for j in jobs:
 	for k in jobs:
@@ -153,14 +155,51 @@ for key, vals in venue_overlap.items():
 	for val in vals:
 		m.addConstrs((X.sum("*",key,t)+(X.sum("*",val,t))<=1 for t in range(1,T+1)), "venue overlaps")
 
-### Sessions must occupy the venue stipulated in the original timetable
+### j=>v: Sessions must occupy the venue stipulated in the original timetable
 for j in jobs:
 	for v in set(venue.values()):
 		m.addConstrs(X[j,v,t]==0 for t in range(1,T+1) if v != venue[j])
 
-### WORK IN PROGRESS 15 FEB 9PM
-### Sessions for subjects in the same focus track do not clash
-### There is at least a 30min break between sessions for subjects in the same track
+### A3 & A4: Sessions for subjects in the same focus track do not clash
+cohort_str = re.compile("C")
+for j in jobs:
+	for k in jobs:
+		for ft in ft_list:
+			# If j and k are in the same track but are different subjects
+			if j != k and ft[j] + ft[k] == 2 and subject[j] != subject[k]:
+				# If j and k are both CS0x, and also the same cohort
+				if class_num[j] == class_num[k] and bool(cohort_str.search(class_num[j])):
+					# Then prevent k from clashing with j's timeslot
+					for t in range(1,T+1):
+						clash = sum(X[j,v,s] for v in set(venue.values()) for s in range(max(1,t+1-proc[j]),t+1))
+						clash += sum(X[k,v,s] for v in set(venue.values()) for s in range(max(1,t+1-proc[j]),t+1))
+						m.addConstr(clash <= 1, "no focus track course clashes")
+
+'''
+### Illustration for A3 & A4 constraints
+
+Step 1:
+	j,k are in the same track, but are different subjects
+
+Step 2:
+	j        | k        | can clash? | remarks
+	-------------------------------------------
+	1 of 1   | 1 of 1   | N          |
+	1 of 1   | 1 of 1-2 | N          | a FT student shld take all CS01s
+	1 of 1-2 | 1 of 1-2 | N          |
+	2 of 1-2 | 2 of 1-2 | N          | or all CS02s
+	-------------------------------------------
+	1 of 1   | 2 of 1-2 | Y          | let other students take 
+	1 of 1-2 | 2 of 1-2 | Y          | mixtures of CS01/CS02
+
+'''
+
+### A1: Preferably at least a 30min break between sessions for subjects in the same track
+for ft in ft_list:
+	for j in jobs:
+		for k in jobs:
+			if j < k and ft[j] == 1 and ft[k] == 1:
+				m.addConstrs((Br[j,t] + Br[k,t] <= 1 + Z[j,k,t] for t in range(1,T+1)), "30min breaks")
 
 print("Constraints defined, starting optimization\n")
 
