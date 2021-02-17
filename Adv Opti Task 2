@@ -4,6 +4,7 @@ solve_half = 1
 
 T = 92 # the last time-index, corresponding to the Fri 1300-1330 timeslot
 EOD_timings = [24, 48, 58, 82, 92] # last time-index of each day
+HASS_block_timings = [14,15,16,17,18,19,25,26,27,72,73,74,75,76,77,89,90,91] # time-indices blocked for HASS
 venue_overlap = {6:[4,5], 32:[30,31]} # e.g. 1.415/1.416: [1.415, 1.416]
 
 #############################################################################
@@ -13,11 +14,12 @@ import pandas as pd
 import os
 import warnings
 import re
+import time
 
 ### Read data to dataframe and create multidict #############################
 #os.chdir("set your wd here")
-ttdata_full = pd.read_csv('TT Data v5.csv')
-ttdata_otherpillars = pd.read_csv('TT_NonESD_Data.csv')
+ttdata_full = pd.read_csv('TT Data v6.csv')
+ttdata_otherpillars = pd.read_csv('TT_NonESD_Data v2.csv')
 
 assert type(solve_term) == int and type(solve_half) == int
 with warnings.catch_warnings():
@@ -63,7 +65,7 @@ blocker, non_ESD_venue, block_start, block_end = gp.multidict({
 	] for i in range(len(ttdata_other_half))
 })
 
-print("\nRead data into multidict")
+print("\nConverted csv data into multidict")
 
 ### Define variables & objective function ###################################
 completion_time = {(j,v,t): t + proc[j] for j in jobs for v in set(venue.values()) for t in range(1,T+1)}
@@ -74,6 +76,8 @@ print("Problem space: %d ESD jobs x %d venues x %d time indices = %d\n"
 print("Creating Gurobi model:")
 m = gp.Model("Adv Opti Task 2 by Kutosotase 2021")
 X = m.addVars(completion_time.keys(), vtype=GRB.BINARY, name="X")
+
+time0 = time.time() # to check solution time
 
 # Variables to ensure classes of a subject are spread out across days
 EOD_splits = [(j,k,t) for j in jobs for k in jobs for t in range(4)]
@@ -88,8 +92,6 @@ else:
 	ft_list = [ft_av, ft_ba, ft_fn, ft_sc, ft_ui]
 
 # Variables to penalise the lack of breaks between classes of a focus track
-#     Let Br=1 if class is in progress, modified (30min after it ends, it is still "in progress")
-Br = {(j,t): X.sum(j,"*",s) for j in jobs for t in range(1,T+1) for s in range(max(0,t-proc[j]), t+1) }
 Z = m.addVars([(j,k,t) for j in jobs for k in jobs for t in range(1,T+1)], vtype=GRB.BINARY, name="Z")
 
 # Objective: minimise the lack of breaks
@@ -129,8 +131,11 @@ for v in set(venue.values()):
 		if v == non_ESD_venue[b]:
 			m.addConstrs((X.sum("*",v,t)==0 for t in range(block_start[b], block_end[b]+1)), "venues blocked by other pillars")
 
-### B6: Venues are blocked by EOD
-m.addConstrs((X.sum("*","*",t)==0 for t in EOD_timings), "venues blocked by EOD")
+### B6: Time slots are blocked by EOD and the blanket block period for HASS
+for t in EOD_timings:
+	m.addConstrs((X.sum(j,"*",s)==0 for j in jobs for s in range(max(1,t-proc[j]+1), t+1)), "time blocked by EOD")
+for t in HASS_block_timings:
+	m.addConstrs((X.sum(j,"*",s)==0 for j in jobs for s in range(max(1,t-proc[j]+1), t+1)), "time blocked for HASS")
 
 ### B4 & A2: Precedence constraints within the same subject & At most one session of each subject in a day
 lecture_str = re.compile("L")
@@ -171,9 +176,9 @@ for j in jobs:
 				if class_num[j] == class_num[k] and bool(cohort_str.search(class_num[j])):
 					# Then prevent k from clashing with j's timeslot
 					for t in range(1,T+1):
-						clash = sum(X[j,v,s] for v in set(venue.values()) for s in range(max(1,t+1-proc[j]),t+1))
-						clash += sum(X[k,v,s] for v in set(venue.values()) for s in range(max(1,t+1-proc[j]),t+1))
-						m.addConstr(clash <= 1, "no focus track course clashes")
+						clash = sum(X[j,venue[j],s] for s in range(max(1,t+1-proc[j]),t+1))
+						clash += sum(X[k,venue[k],s] for s in range(max(1,t+1-proc[j]),t+1))
+						m.addConstr(clash <= 1 + Z[j,k,t], "no focus track course clashes")
 
 '''
 ### Illustration for A3 & A4 constraints
@@ -198,13 +203,24 @@ Step 2:
 for ft in ft_list:
 	for j in jobs:
 		for k in jobs:
-			if j < k and ft[j] == 1 and ft[k] == 1:
-				m.addConstrs((Br[j,t] + Br[k,t] <= 1 + Z[j,k,t] for t in range(1,T+1)), "30min breaks")
+			if j != k and ft[j] == 1 and ft[k] == 1:
+				for t in range(1,T+1):
+					classcount_for_break = 0
+					for s in range(max(1,t-proc[j]),t+1):
+						classcount_for_break += X[j,venue[j],s]
+						classcount_for_break += X[k,venue[k],s]
+					m.addConstr((classcount_for_break <= 1 + Z[j,k,t]), "30min breaks")
 
 print("Constraints defined, starting optimization\n")
+time1 = time.time() # to check solution time
 
 ### Solve and print results #################################################
+m.setParam("TimeLimit", 30) # time limit to search for a solution
 m.optimize()
+time2 = time.time() # to check solution time
+
 for x in X.values():
 	if (x.x > 0.5): print("%s %g" % (x.varName, x.x)) # print decision variables that equal 1
 print("Obj: %g" % m.objVal)
+print("Problem modelled in %g seconds" % (round(time1-time0)))
+print("Optimal solution found in %g seconds" % (round(time2-time1)))
