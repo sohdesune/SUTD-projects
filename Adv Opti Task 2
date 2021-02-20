@@ -171,14 +171,27 @@ for j in jobs:
 	for k in jobs:
 		for ft in ft_list:
 			# If j and k are in the same track but are different subjects
-			if j != k and ft[j] + ft[k] == 2 and subject[j] != subject[k]:
-				# If j and k are both CS0x, and also the same cohort
+			if j != k and ft[j] == 1 and ft[k] == 1 and subject[j] != subject[k]:
+				# Prevent k from clashing with j in the following two cases
+
+				# (1) Both j and k are in the same cohort (i.e. both CS01 or both CS02)
 				if class_num[j] == class_num[k] and bool(cohort_str.search(class_num[j])):
-					# Then prevent k from clashing with j's timeslot
 					for t in range(1,T+1):
 						clash = sum(X[j,venue[j],s] for s in range(max(1,t+1-proc[j]),t+1))
 						clash += sum(X[k,venue[k],s] for s in range(max(1,t+1-proc[j]),t+1))
-						m.addConstr(clash <= 1 + Z[j,k,t], "no focus track course clashes")
+						m.addConstr(clash <= 1, "no focus track course clashes (case 1)")
+				
+				# Implied: j and k are different cohorts or one is a lecture
+				else:
+					num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j]))
+					num_cohort_subject_k = len(set(class_num[i] for i in jobs if subject[i]==subject[k]))
+
+					# (2) j from single-cohort subject, k from multi-cohort subject of the same track
+					if num_cohort_subject_j == 1 and num_cohort_subject_k > 1:
+						for t in range(1,T+1):
+							clash = sum(X[j,venue[j],s] for s in range(max(1,t+1-proc[j]),t+1))
+							clash += sum(X[k,venue[k],s] for s in range(max(1,t+1-proc[j]),t+1))
+							m.addConstr(clash <= 1, "no focus track course clashes (case 2)")
 
 '''
 ### Illustration for A3 & A4 constraints
@@ -203,13 +216,32 @@ Step 2:
 for ft in ft_list:
 	for j in jobs:
 		for k in jobs:
+			# If j and k are in the same track
 			if j != k and ft[j] == 1 and ft[k] == 1:
-				for t in range(1,T+1):
-					classcount_for_break = 0
-					for s in range(max(1,t-proc[j]),t+1):
-						classcount_for_break += X[j,venue[j],s]
-						classcount_for_break += X[k,venue[k],s]
-					m.addConstr((classcount_for_break <= 1 + Z[j,k,t]), "30min breaks")
+				# Add a break between sessions in the following two cases
+
+				# (1) If same cohort (e.g. both CS01) or either class is a lecture
+				if class_num[j] == class_num[k] or bool(lecture_str.search(class_num[j])) or bool(lecture_str.search(class_num[k])):
+					for t in range(1,T+1):
+						classcount_for_break = 0
+						for s in range(max(1,t-proc[j]),t+1):
+							classcount_for_break += X[j,venue[j],s]
+							classcount_for_break += X[k,venue[k],s]
+						m.addConstr((classcount_for_break <= 1 + Z[j,k,t]), "30min breaks (case 1)")
+				
+				# Implied: j and k are different cohorts
+				# (2) j from single-cohort subject, k from multi-cohort subject of the same track
+				elif subject[j] != subject[k]:
+					num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j]))
+					num_cohort_subject_k = len(set(class_num[i] for i in jobs if subject[i]==subject[k]))
+
+					if num_cohort_subject_j == 1 and num_cohort_subject_k > 1:
+						for t in range(1,T+1):
+							classcount_for_break = 0
+							for s in range(max(1,t-proc[j]),t+1):
+								classcount_for_break += X[j,venue[j],s]
+								classcount_for_break += X[k,venue[k],s]
+							m.addConstr((classcount_for_break <= 1 + Z[j,k,t]), "30min breaks (case 2)")
 
 print("Constraints defined, starting optimization\n")
 time1 = time.time() # to check solution time
