@@ -1,7 +1,7 @@
 # Specify optimisation variant (1 or 2 or 3, or 4 [all three])
 solve_variant = 4
 
-# Specify term (5 or 7 or 0 for all) and half (1 or 2) to solve for
+# Specify term (5 or 7, or 0 [both]) and half (1 or 2) to solve for
 solve_term = 0
 solve_half = 1
 
@@ -36,7 +36,7 @@ import warnings
 import re
 import time
 
-### Read data to dataframe and create multidict ###################################################
+### Read Data & Create Multidict ##################################################################
 
 os.chdir("set your wd here")
 ttdata_full = pd.read_csv('TT Data v6.csv')
@@ -62,7 +62,7 @@ elif solve_term == 5:
 else:
 	df = ttdata_T7
 
-# multidict for ESD subjects
+# Multidict for ESD subjects
 jobs, proc, instructor, venue, subject, prec, class_num, ft_core, ft_av, ft_ba, ft_fn, ft_sc, ft_ui = gp.multidict({
 	df["job_ix"][i]: [
 		df["proc_time"][i],
@@ -80,7 +80,7 @@ jobs, proc, instructor, venue, subject, prec, class_num, ft_core, ft_av, ft_ba, 
 	] for i in range(len(df))
 })
 
-# multidict for non-ESD subjects
+# Multidict for non-ESD subjects
 blocker, non_ESD_venue, block_start, block_end = gp.multidict({
 	ttdata_other_half["blocker"][i]: [
 		ttdata_other_half["venue_ix"][i],
@@ -94,14 +94,12 @@ print("\nConverted csv data into multidict")
 
 ### Common Variables ##############################################################################
 
-completion_time = {(j,v,t): t + proc[j] for j in jobs for v in set(venue.values()) for t in range(1,T+1)}
-
 print("Problem space: %d ESD jobs x %d venues x %d time indices = %d\n"
 % (len(jobs), len(set(venue.values())), T, len(jobs)*len(set(venue.values()))*T))
 
 print("Creating Gurobi model:")
 m = gp.Model("Adv Opti Task 3 by Kutosotase 2021")
-X = m.addVars(completion_time.keys(), vtype=GRB.BINARY, name="X")
+X = m.addVars([(j,v,t) for j in jobs for v in set(venue.values()) for t in range(1,T+1)], vtype=GRB.BINARY, name="X")
 
 time0 = time.time() # to check solution time
 
@@ -112,48 +110,55 @@ E = m.addVars(EOD_splits, vtype=GRB.BINARY, name="E")
 # Variables to prevent clashes between focus track subjects
 if solve_term  == 0:
 	ft_list = [ft_core, ft_av, ft_ba, ft_fn, ft_sc, ft_ui]
+	ft_names = ["Term 5", "Aviation", "BA/OR", "Financial Services", "Supply Chain & Logistics", "Urban Infrastructure Systems"]
 elif solve_term == 5:
 	ft_list = [ft_core]
+	ft_names = ["Term 5"]
 else:
 	ft_list = [ft_av, ft_ba, ft_fn, ft_sc, ft_ui]
+	ft_names = ["Aviation", "BA/OR", "Financial Services", "Supply Chain & Logistics", "Urban Infrastructure Systems"]
+
+
+### Additional Variables ##########################################################################
+
+# Variant 1 - Provide 30min breaks between classes of a focus track
+if solve_variant == 1 or solve_variant == 4:
+
+	# Include HASS blockout timings in 30min break provision
+	HASS_block_timings += [13, 20, 24, 28, 71, 78, 88]
+
+	# Z = number of absences of 30min breaks
+	Z = m.addVars([(j,k,t) for j in jobs for k in jobs for t in range(1,T+1)], vtype=GRB.BINARY, name="Z")
+
+# Variant 2 - Compress each focus track into as few days as possible
+if solve_variant == 2 or solve_variant == 4:
+
+	# Number of cohort numbers (e.g. CS01, CS02)
+	cohort_str = re.compile("C")
+	num_cohort_total = len(set(class_num[j] for j in jobs if bool(cohort_str.search(class_num[j]))))
+
+	# D = number of days taken by a focus track, excluding HASS
+	D = m.addVars([(f,l,d) for f in range(len(ft_list)) for l in range(1, num_cohort_total+1) for d in range(1,5+1)], vtype=GRB.BINARY, name="D")
+	Dmax = m.addVar(vtype=GRB.INTEGER, name="Dmax")
+
+# Variant 3 - Prefer certain time slots (punish classes at undesirable timings)
+if solve_variant == 3 or solve_variant == 4:
+
+	pass # no additional variables to define
+
 
 ### Objective Function ############################################################################
 
-if solve_variant == 1: # Variant 1 - provide 30min breaks between classes of a focus track
-	
-	# include HASS blockout timings in 30min break provision
-	HASS_block_timings += [13, 20, 24, 28, 71, 78, 88]
-
-	# Z = number of absences of 30min breaks
-	Z = m.addVars([(j,k,t) for j in jobs for k in jobs for t in range(1,T+1)], vtype=GRB.BINARY, name="Z")
-	# Objective: minimise the lack of breaks
+if solve_variant == 1: # Variant 1 - Minimise the lack of breaks
 	m.setObjective(gp.quicksum(Z[j,k,t] for j in jobs for k in jobs for t in range(1,T+1)), GRB.MINIMIZE)
 
-elif solve_variant == 2: # Variant 2 - compress each focus track into as few days as possible
-	
-	# D = number of days taken by a focus track, excluding HASS
-	D = m.addVars([(f, d) for f in range(len(ft_list)) for d in range(1,5+1)], vtype=GRB.BINARY, name="D")
-	Dmax = m.addVar(vtype=GRB.INTEGER, name="Dmax")
-	# Objective: minimise largest number of days taken per focus track
+elif solve_variant == 2: # Variant 2 - Minimise largest number of days taken per focus track
 	m.setObjective(Dmax, GRB.MINIMIZE)
 
-elif solve_variant == 3: # Variant 3 - prefer certain time slots (punish classes at undesirable timings)
-	
-	# Objective: minimise sum of weighted start times
+elif solve_variant == 3: # Variant 3 - Minimise sum of weighted start times
 	m.setObjective(gp.quicksum(X.sum(j,"*",t)*time_ix_wt[t-1] for j in jobs for t in range(1,T+1)), GRB.MINIMIZE)
 
-else: # Variant 4 - implement all three variants
-
-	# include HASS blockout timings in 30min break provision
-	HASS_block_timings += [13, 20, 24, 28, 71, 78, 88]
-
-	# Z = number of absences of 30min breaks
-	Z = m.addVars([(j,k,t) for j in jobs for k in jobs for t in range(1,T+1)], vtype=GRB.BINARY, name="Z")
-	# D = number of days taken by a focus track, excluding HASS
-	D = m.addVars([(f, d) for f in range(len(ft_list)) for d in range(1,5+1)], vtype=GRB.BINARY, name="D")
-	Dmax = m.addVar(vtype=GRB.INTEGER, name="Dmax")
-
-	# minimise all three objectives
+else: # Variant 4 - Minimise all three objectives
 	obj1 = gp.quicksum(Z[j,k,t] for j in jobs for k in jobs for t in range(1,T+1))
 	obj2 = Dmax
 	obj3 = gp.quicksum(X.sum(j,"*",t)*time_ix_wt[t-1] for j in jobs for t in range(1,T+1))
@@ -162,7 +167,8 @@ else: # Variant 4 - implement all three variants
 
 print("\nObjective function defined for Variant %g" % solve_variant)
 
-### Common constraints ############################################################################
+
+### Common Constraints ############################################################################
 
 ### j=>v: Sessions must occupy the venue stipulated in the original timetable
 for j in jobs:
@@ -246,34 +252,18 @@ for j in jobs:
 				
 				# Implied: j and k are different cohorts or one is a lecture
 				else:
-					num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j]))
-					num_cohort_subject_k = len(set(class_num[i] for i in jobs if subject[i]==subject[k]))
+					num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j] and not bool(lecture_str.search(class_num[i]))))
+					num_cohort_subject_k = len(set(class_num[i] for i in jobs if subject[i]==subject[k] and not bool(lecture_str.search(class_num[i]))))
 
 					# (2) j from single-cohort subject, k from multi-cohort subject of the same track
 					if num_cohort_subject_j == 1 and num_cohort_subject_k > 1:
+						# Since j & k are asymmetric, they are only compared once (jk only, no kj)
+						proc_longer = max(proc[j], proc[k])
 						for t in range(1,T+1):
-							clash = sum(X[j,venue[j],s] for s in range(max(1,t+1-proc[j]),t+1))
-							clash += sum(X[k,venue[k],s] for s in range(max(1,t+1-proc[j]),t+1))
+							clash = sum(X[j,venue[j],s] for s in range(max(1,t+1-proc_longer),t+1))
+							clash += sum(X[k,venue[k],s] for s in range(max(1,t+1-proc_longer),t+1))
 							m.addConstr(clash <= 1, "no focus track course clashes (case 2)")
 
-'''
-### Illustration for A3 & A4 constraints
-
-Step 1:
-	j,k are in the same track, but are different subjects
-
-Step 2:
-	j        | k        | can clash? | remarks
-	-------------------------------------------
-	1 of 1   | 1 of 1   | N          |
-	1 of 1   | 1 of 1-2 | N          | a FT student shld take all CS01s
-	1 of 1-2 | 1 of 1-2 | N          |
-	2 of 1-2 | 2 of 1-2 | N          | or all CS02s
-	-------------------------------------------
-	1 of 1   | 2 of 1-2 | Y          | let other students take 
-	1 of 1-2 | 2 of 1-2 | Y          | mixtures of CS01/CS02
-
-'''
 
 ### Variant-Specific Constraints ##################################################################
 
@@ -298,13 +288,15 @@ if solve_variant == 1 or solve_variant == 4:
 					# Implied: j and k are different cohorts
 					# (2) j from single-cohort subject, k from multi-cohort subject of the same track
 					elif subject[j] != subject[k]:
-						num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j]))
-						num_cohort_subject_k = len(set(class_num[i] for i in jobs if subject[i]==subject[k]))
+						num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j] and not bool(lecture_str.search(class_num[i]))))
+						num_cohort_subject_k = len(set(class_num[i] for i in jobs if subject[i]==subject[k] and not bool(lecture_str.search(class_num[i]))))
 
 						if num_cohort_subject_j == 1 and num_cohort_subject_k > 1:
+							# Since j & k are asymmetric, they are only compared once (jk only, no kj)
+							proc_longer = max(proc[j], proc[k])
 							for t in range(1,T+1):
 								classcount_for_break = 0
-								for s in range(max(1,t-proc[j]),t+1):
+								for s in range(max(1,t-proc_longer),t+1):
 									classcount_for_break += X[j,venue[j],s]
 									classcount_for_break += X[k,venue[k],s]
 								m.addConstr((classcount_for_break <= 1 + Z[j,k,t]), "30min breaks (case 2)")
@@ -312,22 +304,46 @@ if solve_variant == 1 or solve_variant == 4:
 ### V2: Dmax implementation
 if solve_variant == 2 or solve_variant == 4:
 	for ft in ft_list:
-		f = ft_list.index(ft) # get index of focus track for D[f,d]
+		f = ft_list.index(ft) # get index of focus track for D[f,l,d]
 
-		for d in range(len(EOD_timings)):
-			day_end = EOD_timings[d]
-			day_start = 1 if d==0 else EOD_timings[d-1]+1
+		# Check the number of cohorts in focus track f
+		num_cohort_track = len(set(class_num[j] for j in jobs if ft[j]==1 and not bool(lecture_str.search(class_num[j]))))
+		for l in range(1,num_cohort_track+1):
 
-			ft_classes_in_day = 0
-			for t in range(day_start, day_end+1):
+			for d in range(len(EOD_timings)):
+				day_end = EOD_timings[d]
+				day_start = 1 if d==0 else EOD_timings[d-1]+1
+
+				ft_cohort_classes_in_day = 0
 				for j in jobs:
-					# If job j is part of the focus track, check if it is conducted during the day
-					if ft[j] == 1:
-						ft_classes_in_day += X[j,venue[j],t]
-			
-			m.addConstr((ft_classes_in_day <= D[f, d+1]*T), "classes of a focus track in a day") # big T
 
-		m.addConstr((Dmax >= D.sum(f, "*")), "Dmax is largest num of days for 1 focus track")
+					# If job j is part of the focus track
+					if ft[j] == 1:
+
+						assert bool(re.compile("[0-9][0-9]").search(class_num[j][-2:])), "Last 2 chars of class_num are not numerics"
+
+						# First constraint: check if day d is used by cohort l of focus track f
+						# If j is a lecture, always check
+						if bool(lecture_str.search(class_num[j])):
+							ft_cohort_classes_in_day += sum(X[j,venue[j],t] for t in range(day_start, day_end+1))
+							
+						# Elif j is the correct cohort number, then check
+						elif int(class_num[j][-2:]) == l:
+							ft_cohort_classes_in_day += sum(X[j,venue[j],t] for t in range(day_start, day_end+1))
+
+						# Second constraint: if j is from a single-cohort subject, count the day for all cohorts
+						num_cohort_subject_j = len(set(class_num[i] for i in jobs if subject[i]==subject[j] and not bool(lecture_str.search(class_num[j]))))
+						if num_cohort_subject_j == 1:
+							
+							for l_iter in range(1,num_cohort_track+1):
+								# Use T as big M
+								m.addConstr((sum(X[j,venue[j],t] for t in range(day_start, day_end+1)) <= D[f, l_iter, d+1]*T), "all cohorts of FT use that day")
+					
+				# First constraint implementation (using T as big M)
+				m.addConstr((ft_cohort_classes_in_day <= D[f,l,d+1]*T), "classes of a focus track in a day")
+
+			# Implementation of Dmax objective
+			m.addConstr((Dmax >= D.sum(f,l,"*")), "Dmax is largest num of days per cohort per focus track")
 
 ### V3
 if solve_variant == 3 or solve_variant == 4:
@@ -336,13 +352,40 @@ if solve_variant == 3 or solve_variant == 4:
 print("Constraints defined, starting optimisation\n")
 time1 = time.time() # to check solution time
 
-### Solve and print results #################################################
+
+### Solve & Print Results #########################################################################
+
 m.setParam("TimeLimit", max_solve_time) # time limit to search for a solution
 m.optimize()
 time2 = time.time() # to check solution time
 
 for x in X.values():
-	if (x.x > 0.5): print("%s %g" % (x.varName, x.x)) # print decision variables that equal 1
-print("Obj: %g" % m.objVal)
-print("Problem modelled in %g seconds" % (round(time1-time0, 2)))
+	if (x.x > 0.5):
+		print("%s %g" % (x.varName, x.x)) # print decision variables that equal 1
+
+print("\nObjective value: %g" % m.objVal)
+
+if solve_variant == 1 or solve_variant == 4:
+	print("\nNumber of back-to-back classes: %g" % sum(z.x for z in Z.values()))
+
+if solve_variant == 2 or solve_variant == 4:
+	print("\nDays per cohort per focus track:")
+	def get_Dvals(d, f, l):
+		dprint = d.varName.strip("D[]").split(",")
+		if int(dprint[0]) == f and int(dprint[1]) == l:
+			return True
+		else:
+			return False
+
+	for ft in ft_list:
+		f = ft_list.index(ft)
+		num_cohort_track = len(set(class_num[j] for j in jobs if ft[j]==1 and not bool(lecture_str.search(class_num[j]))))
+		for l in range(1,num_cohort_track+1):
+			d_x = 0
+			for d in D.values():
+				if get_Dvals(d, f, l):
+					d_x += d.x
+			print("  %s Cohort %s: %g days" % (ft_names[f], l, d_x))
+
+print("\nProblem modelled in %g seconds" % (round(time1-time0, 2)))
 print("Optimal solution found in %g seconds" % (round(time2-time1, 2)))
