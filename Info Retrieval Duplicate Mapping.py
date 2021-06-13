@@ -30,6 +30,7 @@ qid_dict = dict() # key: qid, value: set_num
 dup_dict = dict() # key: set_num, value: [qids]
 contradiction_count = 0 # cases when is_duplicate=0 but qids are in the same set
 
+# first pass: find all known pairs of duplicates and merge them where possible
 for row in tqdm(df.itertuples(index=False)):
     qid1, qid2, str1, str2 = row[1], row[2], row[3], row[4]
     is_duplicate = row[5] == 1
@@ -65,7 +66,12 @@ for row in tqdm(df.itertuples(index=False)):
                 del dup_dict[set_num_qid2]
         else:
             print(f'Unhandled case: qid1={qid1}, qid2={qid2}')
-    else:
+
+# second pass: given all known sets of duplicates, check remaining items
+for row in tqdm(df.itertuples(index=False)):
+    qid1, qid2, str1, str2 = row[1], row[2], row[3], row[4]
+    is_duplicate = row[5] == 1
+    if not is_duplicate:
         for qid in [qid1,qid2]:
             if qid not in qid_dict:
                 qid_dict[qid] = set_num
